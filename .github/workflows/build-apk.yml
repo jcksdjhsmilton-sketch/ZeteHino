@@ -1,0 +1,692 @@
+# Coloque este arquivo em: .github/workflows/build-apk.yml
+# A cada push (ou manualmente em Actions > Run workflow) ele gera o código
+# do app inteiro, compila e solta o APK em "Artifacts".
+
+name: Build Buscador de Hinos
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Gerar o projeto Android
+        run: |
+          mkdir -p app/src/main/java/com/hinos/buscador app/src/main/res/drawable
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "BuscadorHinos"
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.hinos.buscador'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.hinos.buscador'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:allowBackup="true"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="Buscador de Hinos"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/drawable/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path android:fillColor="#1A3C6E" android:pathData="M0,0h108v108h-108z" />
+              <path
+                  android:fillColor="#00000000"
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="7"
+                  android:pathData="M28,46 a18,18 0 1,0 36,0 a18,18 0 1,0 -36,0" />
+              <path
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="8"
+                  android:strokeLineCap="round"
+                  android:pathData="M59,59L78,78" />
+          </vector>
+          EOF
+
+          cat > app/src/main/java/com/hinos/buscador/AdBlocker.kt <<'EOF'
+          package com.hinos.buscador
+
+          import android.net.Uri
+
+          object AdBlocker {
+
+              // Domínios de anúncios e rastreadores (bloqueados antes de baixar)
+              private val hosts = listOf(
+                  "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+                  "googletagservices.com", "googletagmanager.com", "google-analytics.com",
+                  "adservice.google.com", "2mdn.net", "adnxs.com", "amazon-adsystem.com",
+                  "taboola.com", "outbrain.com", "criteo.com", "criteo.net",
+                  "scorecardresearch.com", "adsrvr.org", "rubiconproject.com",
+                  "pubmatic.com", "openx.net", "moatads.com", "advertising.com",
+                  "adform.net", "smaato.net", "mgid.com", "popads.net",
+                  "propellerads.com", "exoclick.com", "juicyads.com", "hotjar.com",
+                  "ads-twitter.com", "ads.yahoo.com", "adcolony.com", "applovin.com",
+                  "unityads.unity3d.com", "chartboost.com", "inmobi.com", "revcontent.com",
+                  "zedo.com", "yieldmo.com", "teads.tv", "adition.com"
+              )
+
+              fun isBlocked(uri: Uri): Boolean {
+                  val host = (uri.host ?: return false).lowercase()
+                  for (h in hosts) {
+                      if (host == h || host.endsWith(".$h")) return true
+                  }
+                  val path = uri.path ?: ""
+                  if (path.contains("/pagead/") || path.contains("/api/stats/ads")) return true
+                  if (host.contains("google") && path.startsWith("/aclk")) return true
+                  return false
+              }
+
+              // Esconde anúncios que vêm do próprio Google (resultados "Patrocinado")
+              val JS = """
+                  (function(){
+                    if(window.__adb){return;}
+                    window.__adb=1;
+                    var SEL='#tads,#tadsb,#bottomads,#tvcap,.ads-ad,.uEierd,.commercial-unit-desktop-top,.commercial-unit-mobile-top,.pla-unit,.cu-container,[data-text-ad],[data-ad-slot],[data-pla],ins.adsbygoogle,iframe[src*="doubleclick"],iframe[src*="googlesyndication"],[id^="google_ads"],[id^="div-gpt-ad"],.adsbox,.ad-banner';
+                    function hide(e){try{e.style.setProperty('display','none','important');}catch(x){}}
+                    try{
+                      var st=document.createElement('style');
+                      st.textContent=SEL+'{display:none!important}';
+                      (document.head||document.documentElement).appendChild(st);
+                    }catch(x){}
+                    var LAB=['patrocinado','anúncio','anúncios','sponsored','publicidade'];
+                    function sweep(){
+                      try{
+                        var a=document.querySelectorAll(SEL);
+                        for(var i=0;i<a.length;i++){hide(a[i]);}
+                        var sp=document.querySelectorAll('span');
+                        for(var j=0;j<sp.length;j++){
+                          var s=sp[j];
+                          if(s.childElementCount===0){
+                            var t=(s.textContent||'').trim().toLowerCase();
+                            if(t.length<14&&LAB.indexOf(t)>-1){
+                              var c=s.closest('[data-text-ad],.uEierd,.mnr-c,[data-hveid]');
+                              if(c){hide(c);}
+                            }
+                          }
+                        }
+                      }catch(x){}
+                    }
+                    var tm=null;
+                    function later(){if(tm){return;}tm=setTimeout(function(){tm=null;sweep();},400);}
+                    try{new MutationObserver(later).observe(document.documentElement,{childList:true,subtree:true});}catch(x){}
+                    sweep();
+                  })();
+              """.trimIndent()
+          }
+          EOF
+
+          cat > app/src/main/java/com/hinos/buscador/MainActivity.kt <<'EOF'
+          package com.hinos.buscador
+
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.content.Context
+          import android.content.SharedPreferences
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.text.Editable
+          import android.text.TextWatcher
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.inputmethod.EditorInfo
+          import android.view.inputmethod.InputMethodManager
+          import android.webkit.CookieManager
+          import android.webkit.WebChromeClient
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebResourceResponse
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.ArrayAdapter
+          import android.widget.CheckBox
+          import android.widget.EditText
+          import android.widget.FrameLayout
+          import android.widget.HorizontalScrollView
+          import android.widget.LinearLayout
+          import android.widget.ListView
+          import android.widget.ProgressBar
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import org.json.JSONArray
+          import java.io.ByteArrayInputStream
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+          import java.util.concurrent.Executors
+          import java.util.concurrent.atomic.AtomicInteger
+
+          class MainActivity : Activity() {
+
+              data class Engine(val name: String, val home: String, val search: String, val addHino: Boolean)
+
+              // Sites de busca (estilo atalhos do SnapTube). Edite à vontade.
+              private val engines = listOf(
+                  Engine("Google", "https://www.google.com/?hl=pt-BR", "https://www.google.com/search?hl=pt-BR&udm=14&q=%s", true),
+                  Engine("YouTube", "https://m.youtube.com/", "https://m.youtube.com/results?search_query=%s", true),
+                  Engine("Letras", "https://www.letras.mus.br/", "https://www.letras.mus.br/?q=%s", false),
+                  Engine("Cifra Club", "https://www.cifraclub.com.br/", "https://www.cifraclub.com.br/?q=%s", false)
+              )
+
+              private val blue = Color.parseColor("#1A3C6E")
+              private val match = ViewGroup.LayoutParams.MATCH_PARENT
+              private val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+              private val handler = Handler(Looper.getMainLooper())
+              private val io = Executors.newSingleThreadExecutor()
+              private val blocked = AtomicInteger(0)
+              private val suggestions = ArrayList<String>()
+              private var reqId = 0
+              private var pending: Runnable? = null
+              private var silent = false
+              private var engineIndex = 0
+              private var focusHino = true
+
+              private lateinit var prefs: SharedPreferences
+              private lateinit var input: EditText
+              private lateinit var shield: TextView
+              private lateinit var chips: LinearLayout
+              private lateinit var homeView: ScrollView
+              private lateinit var historyHeader: LinearLayout
+              private lateinit var historyBox: LinearLayout
+              private lateinit var suggestList: ListView
+              private lateinit var suggestAdapter: ArrayAdapter<String>
+              private lateinit var web: WebView
+              private lateinit var progress: ProgressBar
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  prefs = getSharedPreferences("hinos", Context.MODE_PRIVATE)
+                  engineIndex = prefs.getInt("engine", 0).coerceIn(0, engines.size - 1)
+                  focusHino = prefs.getBoolean("hino", true)
+                  window.statusBarColor = blue
+                  buildUi()
+                  showHome()
+              }
+
+              private fun buildUi() {
+                  val ctx: Context = this
+
+                  val root = LinearLayout(ctx)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(Color.WHITE)
+                  root.isFocusableInTouchMode = true
+
+                  // ---------- barra de busca ----------
+                  val bar = LinearLayout(ctx)
+                  bar.orientation = LinearLayout.HORIZONTAL
+                  bar.gravity = Gravity.CENTER_VERTICAL
+                  bar.setBackgroundColor(blue)
+                  bar.setPadding(dp(8), dp(8), dp(8), dp(8))
+
+                  val homeBtn = TextView(ctx)
+                  homeBtn.text = "🏠"
+                  homeBtn.textSize = 22f
+                  homeBtn.setPadding(dp(8), dp(4), dp(10), dp(4))
+                  homeBtn.setOnClickListener { showHome() }
+
+                  input = EditText(ctx)
+                  input.hint = "Buscar hino, letra ou cifra…"
+                  input.setSingleLine(true)
+                  input.textSize = 16f
+                  input.setTextColor(Color.BLACK)
+                  input.setHintTextColor(Color.GRAY)
+                  input.imeOptions = EditorInfo.IME_ACTION_SEARCH
+                  val inputBg = GradientDrawable()
+                  inputBg.setColor(Color.WHITE)
+                  inputBg.setCornerRadius(dp(24).toFloat())
+                  input.background = inputBg
+                  input.setPadding(dp(16), dp(10), dp(16), dp(10))
+                  input.setOnEditorActionListener { _, actionId, _ ->
+                      if (actionId == EditorInfo.IME_ACTION_SEARCH) {
+                          doSearch(input.text.toString())
+                          true
+                      } else false
+                  }
+                  input.addTextChangedListener(object : TextWatcher {
+                      override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                      override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                      override fun afterTextChanged(s: Editable?) {
+                          onTyping(s?.toString() ?: "")
+                      }
+                  })
+
+                  val clearBtn = TextView(ctx)
+                  clearBtn.text = "✕"
+                  clearBtn.textSize = 18f
+                  clearBtn.setTextColor(Color.WHITE)
+                  clearBtn.setPadding(dp(12), dp(4), dp(8), dp(4))
+                  clearBtn.setOnClickListener { input.setText("") }
+
+                  shield = TextView(ctx)
+                  shield.text = "🛡 0"
+                  shield.textSize = 13f
+                  shield.setTextColor(Color.WHITE)
+                  shield.setPadding(dp(4), dp(4), dp(6), dp(4))
+
+                  bar.addView(homeBtn)
+                  bar.addView(input, LinearLayout.LayoutParams(0, wrap, 1f))
+                  bar.addView(clearBtn)
+                  bar.addView(shield)
+
+                  // ---------- atalhos de sites (chips) ----------
+                  chips = LinearLayout(ctx)
+                  chips.orientation = LinearLayout.HORIZONTAL
+                  chips.setPadding(dp(8), dp(8), dp(8), dp(4))
+                  for (i in engines.indices) {
+                      val tv = TextView(ctx)
+                      tv.text = engines[i].name
+                      tv.textSize = 14f
+                      tv.setPadding(dp(16), dp(8), dp(16), dp(8))
+                      tv.setOnClickListener { selectEngine(i) }
+                      val lp = LinearLayout.LayoutParams(wrap, wrap)
+                      lp.setMargins(dp(4), 0, dp(4), 0)
+                      chips.addView(tv, lp)
+                  }
+                  val chipScroll = HorizontalScrollView(ctx)
+                  chipScroll.isHorizontalScrollBarEnabled = false
+                  chipScroll.setBackgroundColor(Color.parseColor("#F1F4F9"))
+                  chipScroll.addView(chips)
+
+                  val hinoBox = CheckBox(ctx)
+                  hinoBox.text = "Focar em hinos (acrescenta “hino” na busca)"
+                  hinoBox.textSize = 13f
+                  hinoBox.isChecked = focusHino
+                  hinoBox.setPadding(dp(8), dp(0), dp(8), dp(0))
+                  hinoBox.setBackgroundColor(Color.parseColor("#F1F4F9"))
+                  hinoBox.setOnCheckedChangeListener { _, checked ->
+                      focusHino = checked
+                      prefs.edit().putBoolean("hino", checked).apply()
+                  }
+
+                  // ---------- tela inicial ----------
+                  val homeCol = LinearLayout(ctx)
+                  homeCol.orientation = LinearLayout.VERTICAL
+                  homeCol.setPadding(dp(20), dp(28), dp(20), dp(20))
+
+                  val title = TextView(ctx)
+                  title.text = "Buscador de Hinos"
+                  title.textSize = 26f
+                  title.setTypeface(null, Typeface.BOLD)
+                  title.setTextColor(blue)
+
+                  val sub = TextView(ctx)
+                  sub.text = "Digite o nome ou o número do hino e toque em buscar."
+                  sub.textSize = 15f
+                  sub.setTextColor(Color.GRAY)
+                  sub.setPadding(0, dp(4), 0, dp(24))
+
+                  historyHeader = LinearLayout(ctx)
+                  historyHeader.orientation = LinearLayout.HORIZONTAL
+                  val hTitle = TextView(ctx)
+                  hTitle.text = "Recentes"
+                  hTitle.textSize = 15f
+                  hTitle.setTypeface(null, Typeface.BOLD)
+                  hTitle.setTextColor(Color.DKGRAY)
+                  val hClear = TextView(ctx)
+                  hClear.text = "Limpar"
+                  hClear.textSize = 14f
+                  hClear.setTextColor(blue)
+                  hClear.setOnClickListener {
+                      prefs.edit().remove("history").apply()
+                      renderHistory()
+                  }
+                  historyHeader.addView(hTitle, LinearLayout.LayoutParams(0, wrap, 1f))
+                  historyHeader.addView(hClear)
+
+                  historyBox = LinearLayout(ctx)
+                  historyBox.orientation = LinearLayout.VERTICAL
+
+                  homeCol.addView(title)
+                  homeCol.addView(sub)
+                  homeCol.addView(historyHeader)
+                  homeCol.addView(historyBox)
+                  homeView = ScrollView(ctx)
+                  homeView.addView(homeCol)
+
+                  // ---------- sugestões ----------
+                  suggestAdapter = ArrayAdapter(ctx, android.R.layout.simple_list_item_1, suggestions)
+                  suggestList = ListView(ctx)
+                  suggestList.adapter = suggestAdapter
+                  suggestList.setBackgroundColor(Color.WHITE)
+                  suggestList.visibility = View.GONE
+                  suggestList.setOnItemClickListener { _, _, pos, _ ->
+                      val s = suggestions[pos]
+                      setInput(s)
+                      doSearch(s)
+                  }
+
+                  // ---------- navegador ----------
+                  web = WebView(ctx)
+                  web.visibility = View.GONE
+                  setupWeb()
+
+                  progress = ProgressBar(ctx, null, android.R.attr.progressBarStyleHorizontal)
+                  progress.max = 100
+                  progress.visibility = View.GONE
+
+                  val frame = FrameLayout(ctx)
+                  frame.addView(homeView, FrameLayout.LayoutParams(match, match))
+                  frame.addView(web, FrameLayout.LayoutParams(match, match))
+                  frame.addView(progress, FrameLayout.LayoutParams(match, dp(3)))
+                  frame.addView(suggestList, FrameLayout.LayoutParams(match, match))
+
+                  root.addView(bar, LinearLayout.LayoutParams(match, wrap))
+                  root.addView(chipScroll, LinearLayout.LayoutParams(match, wrap))
+                  root.addView(hinoBox, LinearLayout.LayoutParams(match, wrap))
+                  root.addView(frame, LinearLayout.LayoutParams(match, 0, 1f))
+
+                  setContentView(root)
+                  root.requestFocus()
+                  styleChips()
+              }
+
+              @SuppressLint("SetJavaScriptEnabled")
+              private fun setupWeb() {
+                  val s = web.settings
+                  s.javaScriptEnabled = true
+                  s.domStorageEnabled = true
+                  s.setSupportMultipleWindows(false)
+                  s.javaScriptCanOpenWindowsAutomatically = false
+                  s.userAgentString = s.userAgentString.replace("; wv", "")
+
+                  val cm = CookieManager.getInstance()
+                  cm.setAcceptCookie(true)
+                  cm.setAcceptThirdPartyCookies(web, false)
+
+                  web.webViewClient = object : WebViewClient() {
+                      override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                          if (!request.isForMainFrame && AdBlocker.isBlocked(request.url)) {
+                              val n = blocked.incrementAndGet()
+                              runOnUiThread { shield.text = "🛡 " + n }
+                              return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                          }
+                          return super.shouldInterceptRequest(view, request)
+                      }
+
+                      override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                          val sc = request.url.scheme ?: ""
+                          // só http/https; ignora intent://, market:// e afins
+                          return !(sc == "http" || sc == "https")
+                      }
+
+                      override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+                          super.onPageStarted(view, url, favicon)
+                          view.evaluateJavascript(AdBlocker.JS, null)
+                      }
+
+                      override fun onPageFinished(view: WebView, url: String?) {
+                          super.onPageFinished(view, url)
+                          view.evaluateJavascript(AdBlocker.JS, null)
+                      }
+                  }
+
+                  web.webChromeClient = object : WebChromeClient() {
+                      override fun onProgressChanged(view: WebView, newProgress: Int) {
+                          progress.progress = newProgress
+                          progress.visibility = if (newProgress in 1..99) View.VISIBLE else View.GONE
+                      }
+                  }
+              }
+
+              // ---------- busca ----------
+              private fun doSearch(raw: String) {
+                  pending?.let { handler.removeCallbacks(it) }
+                  reqId++
+                  val q = raw.trim()
+                  val e = engines[engineIndex]
+                  if (q.isEmpty()) {
+                      openUrl(e.home)
+                      return
+                  }
+                  saveHistory(q)
+                  var term = q
+                  if (focusHino && e.addHino && !term.lowercase().contains("hino")) term += " hino"
+                  openUrl(e.search.replace("%s", URLEncoder.encode(term, "UTF-8")))
+              }
+
+              private fun openUrl(url: String) {
+                  hideKeyboard()
+                  suggestList.visibility = View.GONE
+                  homeView.visibility = View.GONE
+                  web.visibility = View.VISIBLE
+                  web.loadUrl(url)
+              }
+
+              private fun showHome() {
+                  hideKeyboard()
+                  suggestList.visibility = View.GONE
+                  if (web.visibility == View.VISIBLE) {
+                      web.loadUrl("about:blank")
+                      web.clearHistory()
+                  }
+                  web.visibility = View.GONE
+                  homeView.visibility = View.VISIBLE
+                  renderHistory()
+              }
+
+              private fun selectEngine(i: Int) {
+                  engineIndex = i
+                  prefs.edit().putInt("engine", i).apply()
+                  styleChips()
+                  doSearch(input.text.toString())
+              }
+
+              private fun styleChips() {
+                  for (i in 0 until chips.childCount) {
+                      val tv = chips.getChildAt(i) as TextView
+                      val sel = i == engineIndex
+                      tv.setTextColor(if (sel) Color.WHITE else blue)
+                      val bg = GradientDrawable()
+                      bg.setColor(if (sel) blue else Color.WHITE)
+                      bg.setStroke(dp(1), blue)
+                      bg.setCornerRadius(dp(18).toFloat())
+                      tv.background = bg
+                  }
+              }
+
+              private fun setInput(s: String) {
+                  silent = true
+                  input.setText(s)
+                  input.setSelection(s.length)
+                  silent = false
+              }
+
+              private fun hideKeyboard() {
+                  val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                  imm.hideSoftInputFromWindow(input.windowToken, 0)
+                  input.clearFocus()
+              }
+
+              // ---------- sugestões ao digitar (igual SnapTube) ----------
+              private fun onTyping(text: String) {
+                  if (silent) return
+                  pending?.let { handler.removeCallbacks(it) }
+                  val q = text.trim()
+                  if (q.isEmpty()) {
+                      reqId++
+                      suggestions.clear()
+                      suggestAdapter.notifyDataSetChanged()
+                      suggestList.visibility = View.GONE
+                      return
+                  }
+                  val r = Runnable { fetchSuggestions(q) }
+                  pending = r
+                  handler.postDelayed(r, 180)
+              }
+
+              private fun fetchSuggestions(q: String) {
+                  val id = ++reqId
+                  io.execute {
+                      val list = ArrayList<String>()
+                      try {
+                          val u = URL("https://suggestqueries.google.com/complete/search?client=firefox&hl=pt-BR&ie=utf-8&oe=utf-8&q=" + URLEncoder.encode(q, "UTF-8"))
+                          val c = u.openConnection() as HttpURLConnection
+                          c.connectTimeout = 4000
+                          c.readTimeout = 4000
+                          val body = c.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                          c.disconnect()
+                          val arr = JSONArray(body).getJSONArray(1)
+                          for (i in 0 until arr.length()) list.add(arr.getString(i))
+                      } catch (e: Exception) {
+                      }
+                      runOnUiThread { if (id == reqId) showSuggestions(q, list) }
+                  }
+              }
+
+              private fun showSuggestions(q: String, remote: List<String>) {
+                  if (input.text.toString().trim() != q) return
+                  val local = history().filter { it.contains(q, true) && !it.equals(q, true) }.take(3)
+                  suggestions.clear()
+                  suggestions.addAll((local + remote).distinct().take(10))
+                  suggestAdapter.notifyDataSetChanged()
+                  suggestList.visibility = if (suggestions.isEmpty()) View.GONE else View.VISIBLE
+              }
+
+              // ---------- histórico ----------
+              private fun history(): List<String> {
+                  val raw = prefs.getString("history", "[]") ?: "[]"
+                  return try {
+                      val a = JSONArray(raw)
+                      (0 until a.length()).map { a.getString(it) }
+                  } catch (e: Exception) {
+                      emptyList()
+                  }
+              }
+
+              private fun saveHistory(q: String) {
+                  val list = history().toMutableList()
+                  list.removeAll { it.equals(q, true) }
+                  list.add(0, q)
+                  val arr = JSONArray()
+                  for (item in list.take(15)) arr.put(item)
+                  prefs.edit().putString("history", arr.toString()).apply()
+              }
+
+              private fun renderHistory() {
+                  historyBox.removeAllViews()
+                  val h = history()
+                  historyHeader.visibility = if (h.isEmpty()) View.GONE else View.VISIBLE
+                  for (q in h) {
+                      val tv = TextView(this)
+                      tv.text = "🕘  " + q
+                      tv.textSize = 16f
+                      tv.setTextColor(Color.BLACK)
+                      tv.setPadding(0, dp(12), 0, dp(12))
+                      tv.setOnClickListener {
+                          setInput(q)
+                          doSearch(q)
+                      }
+                      historyBox.addView(tv)
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onBackPressed() {
+                  when {
+                      suggestList.visibility == View.VISIBLE -> suggestList.visibility = View.GONE
+                      web.visibility == View.VISIBLE && web.canGoBack() -> web.goBack()
+                      web.visibility == View.VISIBLE -> showHome()
+                      else -> super.onBackPressed()
+                  }
+              }
+
+              override fun onDestroy() {
+                  web.destroy()
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Compilar APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Enviar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: BuscadorDeHinos-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
