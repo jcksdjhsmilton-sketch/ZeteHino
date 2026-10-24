@@ -1,0 +1,675 @@
+name: ZeteHino APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Gerar o projeto ZeteHino
+        run: |
+          set -e
+          mkdir -p ZeteHino && cd ZeteHino
+          P=app/src/main
+          mkdir -p $P/java/org/zetehino/app $P/assets $P/res/drawable
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "ZeteHino"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "org.zetehino.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "org.zetehino.app"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+
+          cat > $P/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <application
+                  android:label="ZeteHino"
+                  android:icon="@drawable/ic_launcher"
+                  android:allowBackup="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > $P/res/drawable/ic_launcher.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#0A84FF"
+                  android:pathData="M24,0h60a24,24 0 0 1 24,24v60a24,24 0 0 1 -24,24h-60a24,24 0 0 1 -24,-24v-60a24,24 0 0 1 24,-24z" />
+              <path android:fillColor="#FFFFFF"
+                  android:pathData="M44,72 a12,9 0 1 0 24,0 a12,9 0 1 0 -24,0 z" />
+              <path android:fillColor="#FFFFFF"
+                  android:pathData="M64,28 L84,34 L84,44 L70,40 L70,72 L64,72 Z" />
+          </vector>
+          EOF
+
+          cat > $P/java/org/zetehino/app/MainActivity.kt <<'EOF'
+          package org.zetehino.app
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.content.ContentUris
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.media.AudioAttributes
+          import android.media.MediaPlayer
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.PowerManager
+          import android.provider.MediaStore
+          import android.webkit.JavascriptInterface
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+          import kotlin.concurrent.thread
+
+          class MainActivity : Activity() {
+
+              private lateinit var web: WebView
+              private var mp: MediaPlayer? = null
+              @Volatile private var ready = false
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.statusBarColor = Color.BLACK
+                  window.navigationBarColor = Color.BLACK
+                  web = WebView(this)
+                  web.setBackgroundColor(Color.BLACK)
+                  web.settings.javaScriptEnabled = true
+                  web.settings.domStorageEnabled = true
+                  web.addJavascriptInterface(this, "Android")
+                  web.webViewClient = WebViewClient()
+                  setContentView(web)
+                  web.loadUrl("file:///android_asset/index.html")
+                  if (!hasPerm()) requestPermissions(arrayOf(permName()), 1)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  js("typeof loadLib==='function'&&loadLib()")
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  js("loadLib()")
+              }
+
+              @Suppress("OVERRIDE_DEPRECATION")
+              override fun onBackPressed() {
+                  moveTaskToBack(true)
+              }
+
+              override fun onDestroy() {
+                  mp?.release()
+                  mp = null
+                  super.onDestroy()
+              }
+
+              private fun permName() =
+                  if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_AUDIO
+                  else Manifest.permission.READ_EXTERNAL_STORAGE
+
+              private fun hasPerm() = checkSelfPermission(permName()) == PackageManager.PERMISSION_GRANTED
+
+              private fun js(code: String) {
+                  runOnUiThread { web.evaluateJavascript(code, null) }
+              }
+
+              private fun songsDir(): File =
+                  File(getExternalFilesDir("Music") ?: filesDir, "hinos").apply { mkdirs() }
+
+              private fun get(u: String): String {
+                  val c = URL(u).openConnection() as HttpURLConnection
+                  c.connectTimeout = 15000
+                  c.readTimeout = 20000
+                  c.setRequestProperty("User-Agent", "ZeteHino/1.0")
+                  return c.inputStream.bufferedReader().use { it.readText() }
+              }
+
+              private fun firstStr(o: JSONObject, k: String): String {
+                  val v = o.opt(k)
+                  return when (v) {
+                      is JSONArray -> v.optString(0)
+                      null -> ""
+                      else -> v.toString()
+                  }
+              }
+
+              // ---------- Biblioteca ----------
+              @JavascriptInterface
+              fun askPerm() {
+                  runOnUiThread { requestPermissions(arrayOf(permName()), 1) }
+              }
+
+              @JavascriptInterface
+              fun library(): String {
+                  val arr = JSONArray()
+                  songsDir().listFiles()
+                      ?.filter { it.name.endsWith(".mp3") }
+                      ?.sortedBy { it.name.lowercase() }
+                      ?.forEach { f ->
+                          val parts = f.nameWithoutExtension.split("__")
+                          arr.put(
+                              JSONObject()
+                                  .put("title", parts[0])
+                                  .put("artist", parts.getOrElse(1) { "" })
+                                  .put("src", f.absolutePath)
+                                  .put("dl", true)
+                          )
+                      }
+                  if (hasPerm()) {
+                      val base = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                      val cols = arrayOf(
+                          MediaStore.Audio.Media._ID,
+                          MediaStore.Audio.Media.TITLE,
+                          MediaStore.Audio.Media.ARTIST
+                      )
+                      val sel = "${MediaStore.Audio.Media.IS_MUSIC}!=0 AND ${MediaStore.Audio.Media.DURATION}>=20000"
+                      val order = "${MediaStore.Audio.Media.TITLE} COLLATE NOCASE ASC"
+                      try {
+                          contentResolver.query(base, cols, sel, null, order)?.use { c ->
+                              while (c.moveToNext()) {
+                                  val artist = c.getString(2) ?: ""
+                                  arr.put(
+                                      JSONObject()
+                                          .put("title", c.getString(1) ?: "Sem título")
+                                          .put("artist", if (artist == "<unknown>") "" else artist)
+                                          .put("src", ContentUris.withAppendedId(base, c.getLong(0)).toString())
+                                          .put("dl", false)
+                                  )
+                              }
+                          }
+                      } catch (e: Exception) { }
+                  }
+                  return arr.toString()
+              }
+
+              // ---------- Player ----------
+              @JavascriptInterface
+              fun play(src: String) {
+                  runOnUiThread {
+                      try {
+                          ready = false
+                          mp?.release()
+                          val p = MediaPlayer()
+                          mp = p
+                          p.setAudioAttributes(
+                              AudioAttributes.Builder()
+                                  .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                                  .setUsage(AudioAttributes.USAGE_MEDIA)
+                                  .build()
+                          )
+                          p.setWakeMode(applicationContext, PowerManager.PARTIAL_WAKE_LOCK)
+                          if (src.startsWith("content://")) p.setDataSource(applicationContext, Uri.parse(src))
+                          else p.setDataSource(src)
+                          p.setOnPreparedListener { ready = true; it.start() }
+                          p.setOnCompletionListener { js("onEnded()") }
+                          p.setOnErrorListener { _, _, _ -> js("onPlayError()"); true }
+                          p.prepareAsync()
+                      } catch (e: Exception) {
+                          js("onPlayError()")
+                      }
+                  }
+              }
+
+              @JavascriptInterface
+              fun toggle() {
+                  runOnUiThread {
+                      val p = mp
+                      if (p != null && ready) {
+                          if (p.isPlaying) p.pause() else p.start()
+                      }
+                  }
+              }
+
+              @JavascriptInterface
+              fun seek(ms: Int) {
+                  runOnUiThread {
+                      val p = mp
+                      if (p != null && ready) p.seekTo(ms)
+                  }
+              }
+
+              @JavascriptInterface
+              fun status(): String {
+                  return try {
+                      val p = mp
+                      if (p != null && ready) "${if (p.isPlaying) 1 else 0},${p.currentPosition},${p.duration}"
+                      else "-1,0,0"
+                  } catch (e: Exception) {
+                      "-1,0,0"
+                  }
+              }
+
+              // ---------- Buscar e baixar (Internet Archive) ----------
+              @JavascriptInterface
+              fun search(q: String) {
+                  thread {
+                      try {
+                          val query = URLEncoder.encode("($q) AND mediatype:audio", "UTF-8")
+                          val url = "https://archive.org/advancedsearch.php?q=$query" +
+                              "&fl%5B%5D=identifier&fl%5B%5D=title&fl%5B%5D=creator" +
+                              "&rows=25&sort%5B%5D=downloads+desc&output=json"
+                          val docs = JSONObject(get(url)).getJSONObject("response").getJSONArray("docs")
+                          val out = JSONArray()
+                          for (i in 0 until docs.length()) {
+                              val d = docs.getJSONObject(i)
+                              out.put(
+                                  JSONObject()
+                                      .put("id", firstStr(d, "identifier"))
+                                      .put("title", firstStr(d, "title"))
+                                      .put("artist", firstStr(d, "creator"))
+                              )
+                          }
+                          js("onSearch(" + JSONObject.quote(out.toString()) + ")")
+                      } catch (e: Exception) {
+                          js("onSearchErr()")
+                      }
+                  }
+              }
+
+              @JavascriptInterface
+              fun download(id: String, title: String, artist: String) {
+                  thread {
+                      val qid = JSONObject.quote(id)
+                      try {
+                          val meta = JSONObject(get("https://archive.org/metadata/" + Uri.encode(id)))
+                          val files = meta.getJSONArray("files")
+                          var name = ""
+                          for (i in 0 until files.length()) {
+                              val n = files.getJSONObject(i).optString("name")
+                              if (n.endsWith(".mp3", true)) { name = n; break }
+                          }
+                          if (name.isEmpty()) { js("onDl($qid,-1)"); return@thread }
+
+                          val conn = URL("https://archive.org/download/" + Uri.encode(id) + "/" + Uri.encode(name, "/"))
+                              .openConnection() as HttpURLConnection
+                          conn.connectTimeout = 15000
+                          conn.readTimeout = 30000
+                          conn.setRequestProperty("User-Agent", "ZeteHino/1.0")
+                          val total = conn.contentLength
+
+                          val clean = { s: String -> s.replace(Regex("[^\\p{L}\\p{N} .()-]"), "").trim().take(80) }
+                          val base = clean(title).ifEmpty { "hino" } + "__" + clean(artist)
+                          val out = File(songsDir(), "$base.mp3")
+                          val tmp = File(songsDir(), "$base.part")
+
+                          conn.inputStream.use { input ->
+                              tmp.outputStream().use { o ->
+                                  val buf = ByteArray(32768)
+                                  var got = 0L
+                                  var last = -1
+                                  while (true) {
+                                      val n = input.read(buf)
+                                      if (n < 0) break
+                                      o.write(buf, 0, n)
+                                      got += n
+                                      if (total > 0) {
+                                          val pc = (got * 99 / total).toInt()
+                                          if (pc != last) { last = pc; js("onDl($qid,$pc)") }
+                                      }
+                                  }
+                              }
+                          }
+                          if (out.exists()) out.delete()
+                          tmp.renameTo(out)
+                          js("onDl($qid,100)")
+                      } catch (e: Exception) {
+                          js("onDl($qid,-1)")
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > $P/assets/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html lang="pt-BR">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+          <title>ZeteHino</title>
+          <style>
+          :root{--bg:#000;--card:#1c1c1e;--card2:#2c2c2e;--sub:#8e8e93;--acc:#0a84ff;--sep:rgba(255,255,255,.1)}
+          *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+          html,body{height:100%;background:var(--bg);color:#fff;overflow:hidden;
+            font-family:-apple-system,"SF Pro Text","Segoe UI",Roboto,system-ui,sans-serif}
+          #app{height:100%}
+          .screen{display:none;height:100%;overflow-y:auto;padding:18px 16px 200px}
+          .screen.on{display:block}
+          h1{font-size:36px;font-weight:800;letter-spacing:-.6px;margin:6px 4px 14px}
+          .field{width:100%;height:46px;border:none;border-radius:12px;background:var(--card2);color:#fff;
+            font-size:18px;padding:0 14px;outline:none;margin-bottom:10px;-webkit-appearance:none}
+          .field::placeholder{color:var(--sub)}
+          .srow{display:flex;gap:10px;align-items:flex-start}
+          .btn{height:46px;padding:0 20px;border:none;border-radius:12px;background:var(--acc);color:#fff;
+            font-size:17px;font-weight:600;flex:none}
+          .btn:active,.get:active{opacity:.7}
+          .hint{color:var(--sub);font-size:16px;line-height:1.4;margin:8px 4px 14px}
+          .empty{text-align:center;padding:50px 20px}
+          .empty p{color:var(--sub);font-size:18px;margin-bottom:18px}
+          .row{display:flex;align-items:center;gap:14px;padding:10px 8px;border-radius:14px}
+          .row:active{background:var(--card)}
+          .row.on b{color:var(--acc)}
+          .row+.row{border-top:1px solid var(--sep);border-radius:0}
+          .art{display:flex;align-items:center;justify-content:center;flex:none;font-weight:700;
+            color:rgba(255,255,255,.92);width:56px;height:56px;border-radius:12px;font-size:24px;
+            box-shadow:0 2px 8px rgba(0,0,0,.4)}
+          .info{flex:1;min-width:0}
+          .info b{display:block;font-size:19px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+          .info span{display:block;font-size:15px;color:var(--sub);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+          .get{border:none;background:rgba(10,132,255,.18);color:var(--acc);font-weight:700;font-size:16px;
+            padding:9px 16px;border-radius:999px;flex:none}
+          .ok{color:#30d158;font-weight:600;font-size:15px;flex:none}
+          .pct{color:var(--acc);font-weight:700;font-size:16px;flex:none}
+          #tabs{position:fixed;left:0;right:0;bottom:0;height:66px;display:flex;z-index:10;
+            background:rgba(28,28,30,.85);-webkit-backdrop-filter:blur(24px);backdrop-filter:blur(24px);
+            border-top:1px solid var(--sep)}
+          #tabs button{flex:1;border:none;background:none;color:var(--sub);display:flex;flex-direction:column;
+            align-items:center;justify-content:center;gap:3px;font-size:13px;font-weight:600}
+          #tabs button.on{color:var(--acc)}
+          #tabs svg{width:28px;height:28px}
+          #mini{position:fixed;left:10px;right:10px;bottom:76px;height:64px;border-radius:18px;z-index:9;
+            display:flex;align-items:center;gap:12px;padding:0 10px;
+            background:rgba(44,44,46,.9);-webkit-backdrop-filter:blur(24px);backdrop-filter:blur(24px);
+            box-shadow:0 6px 24px rgba(0,0,0,.5)}
+          #mini .art{width:44px;height:44px;font-size:20px;border-radius:10px}
+          #mini .info b{font-size:17px}
+          .ib{border:none;background:none;color:#fff;width:46px;height:46px;display:flex;align-items:center;justify-content:center;flex:none}
+          .ib svg{width:30px;height:30px}
+          .ib:active{opacity:.6}
+          #full{position:fixed;inset:0;z-index:20;display:flex;flex-direction:column;align-items:center;
+            padding:20px 28px 30px;transform:translateY(100%);transition:transform .35s cubic-bezier(.2,.8,.2,1);background:#111}
+          #full.open{transform:none}
+          .close{align-self:flex-start;border:none;background:rgba(255,255,255,.15);color:#fff;
+            width:44px;height:44px;border-radius:50%;display:flex;align-items:center;justify-content:center}
+          .close svg{width:26px;height:26px}
+          .art.big{width:min(76vw,310px);height:min(76vw,310px);font-size:120px;border-radius:24px;
+            margin:5vh 0 4vh;box-shadow:0 20px 50px rgba(0,0,0,.55)}
+          #full h2{font-size:25px;font-weight:700;text-align:center;width:100%;
+            display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+          #full p{color:rgba(255,255,255,.65);font-size:18px;margin-top:6px;text-align:center}
+          #sk{-webkit-appearance:none;appearance:none;width:100%;height:6px;border-radius:3px;
+            background:rgba(255,255,255,.25);outline:none;margin-top:4vh}
+          #sk::-webkit-slider-thumb{-webkit-appearance:none;width:24px;height:24px;border-radius:50%;background:#fff}
+          .times{display:flex;justify-content:space-between;width:100%;color:rgba(255,255,255,.6);font-size:14px;margin-top:8px}
+          .ctl{display:flex;align-items:center;justify-content:center;gap:30px;margin-top:3vh}
+          .ctl .ib svg{width:42px;height:42px}
+          .ctl .main{width:82px;height:82px;border-radius:50%;background:#fff;color:#000}
+          .ctl .main svg{width:44px;height:44px}
+          #toast{position:fixed;left:50%;top:70px;transform:translateX(-50%);background:rgba(60,60,62,.95);
+            padding:12px 20px;border-radius:999px;font-size:16px;z-index:50;opacity:0;transition:opacity .25s;pointer-events:none}
+          #toast.show{opacity:1}
+          .hide{display:none!important}
+          </style>
+          </head>
+          <body>
+          <div id="app">
+            <section id="s-lib" class="screen on">
+              <h1>Hinos</h1>
+              <input id="fl" class="field" type="search" placeholder="Procurar nos meus hinos" autocomplete="off">
+              <div id="lib"></div>
+            </section>
+            <section id="s-net" class="screen">
+              <h1>Buscar</h1>
+              <div class="srow">
+                <input id="nq" class="field" type="search" placeholder="Nome do hino ou artista" autocomplete="off">
+                <button id="go" class="btn">Buscar</button>
+              </div>
+              <p id="nmsg" class="hint">Digite o nome e toque em Buscar. Os hinos baixados ficam salvos no celular e tocam sem internet.</p>
+              <div id="net"></div>
+            </section>
+          </div>
+
+          <div id="mini" class="hide">
+            <div class="art" id="ma"></div>
+            <div class="info" id="mopen"><b id="mt"></b><span id="ms"></span></div>
+            <button class="ib" id="mpp"></button>
+            <button class="ib" id="mnx"></button>
+          </div>
+
+          <nav id="tabs">
+            <button class="on" data-t="lib">
+              <svg viewBox="0 0 24 24"><path d="M9 18V6l10-2v12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="7" cy="18" r="2.5" fill="currentColor"/><circle cx="17" cy="16" r="2.5" fill="currentColor"/></svg>
+              Hinos
+            </button>
+            <button data-t="net">
+              <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16 16l4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+              Buscar
+            </button>
+          </nav>
+
+          <div id="full">
+            <button class="close" id="fc"><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+            <div class="art big" id="fa"></div>
+            <h2 id="ft"></h2>
+            <p id="fs"></p>
+            <input id="sk" type="range" min="0" max="1000" value="0">
+            <div class="times"><span id="t1">0:00</span><span id="t2">-0:00</span></div>
+            <div class="ctl">
+              <button class="ib" id="pv"></button>
+              <button class="ib main" id="pp"></button>
+              <button class="ib" id="nx"></button>
+            </div>
+          </div>
+          <div id="toast"></div>
+
+          <script>
+          const I={
+            play:'<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>',
+            pause:'<svg viewBox="0 0 24 24"><path d="M6 5h4v14H6zM14 5h4v14h-4z" fill="currentColor"/></svg>',
+            next:'<svg viewBox="0 0 24 24"><path d="M6 6l9 6-9 6zM16 6h2v12h-2z" fill="currentColor"/></svg>',
+            prev:'<svg viewBox="0 0 24 24"><path d="M18 6l-9 6 9 6zM8 6H6v12h2z" fill="currentColor"/></svg>'
+          };
+          const $=s=>document.querySelector(s);
+          let lib=[],view=[],queue=[],qi=-1,cur=null,playing=false,seeking=false,pos=0,dur=0,res=[],dl={},done={};
+
+          const norm=s=>(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+          const esc=s=>String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+          const hue=s=>{let h=7;for(const c of String(s))h=(h*31+c.charCodeAt(0))%360;return h};
+          const artCss=t=>{const h=hue(t);return 'background:linear-gradient(145deg,hsl('+h+',70%,58%),hsl('+((h+45)%360)+',70%,34%))'};
+          const letter=t=>esc((t||'').trim().charAt(0).toUpperCase()||'♪');
+          const artHtml=t=>'<div class="art" style="'+artCss(t)+'">'+letter(t)+'</div>';
+          const setArt=(el,t)=>{el.style.cssText=artCss(t);el.textContent=(t||'').trim().charAt(0).toUpperCase()||'♪'};
+          const fmt=ms=>{const s=Math.max(0,Math.floor(ms/1000));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
+          let tt;const toast=m=>{const t=$('#toast');t.textContent=m;t.classList.add('show');clearTimeout(tt);tt=setTimeout(()=>t.classList.remove('show'),2400)};
+
+          /* ---------- Biblioteca ---------- */
+          function loadLib(){try{lib=JSON.parse(Android.library())}catch(e){lib=[]}renderLib();renderNet()}
+          function renderLib(){
+            const el=$('#lib');
+            if(!lib.length){
+              el.innerHTML='<div class="empty"><p>Nenhum hino encontrado neste celular.</p><button class="btn" id="perm">Permitir acesso às músicas</button></div>';
+              $('#perm').onclick=()=>Android.askPerm();view=[];return;
+            }
+            const f=norm($('#fl').value);
+            view=lib.filter(s=>!f||norm(s.title+' '+s.artist).includes(f));
+            el.innerHTML=view.map((s,i)=>'<div class="row" data-i="'+i+'">'+artHtml(s.title)+
+              '<div class="info"><b>'+esc(s.title)+'</b><span>'+esc(s.artist||'Hino')+'</span></div></div>').join('')
+              ||'<p class="hint">Nada encontrado.</p>';
+            hl();
+          }
+          function hl(){document.querySelectorAll('#lib .row').forEach(r=>{const s=view[+r.dataset.i];r.classList.toggle('on',!!(s&&cur&&s.src===cur.src))})}
+          $('#fl').addEventListener('input',renderLib);
+          $('#lib').addEventListener('click',e=>{const r=e.target.closest('.row');if(r)start(view,+r.dataset.i)});
+
+          /* ---------- Player ---------- */
+          function start(list,i){queue=list.slice();qi=i;playCur()}
+          function playCur(){cur=queue[qi];playing=true;pos=0;dur=0;Android.play(cur.src);updUI();hl()}
+          function next(){if(!queue.length)return;qi=(qi+1)%queue.length;playCur()}
+          function prev(){if(!queue.length)return;if(pos>3000){Android.seek(0);return}qi=(qi-1+queue.length)%queue.length;playCur()}
+          function toggle(){Android.toggle();playing=!playing;updPP()}
+          function updPP(){const h=playing?I.pause:I.play;$('#mpp').innerHTML=h;$('#pp').innerHTML=h}
+          function updUI(){
+            if(!cur)return;
+            $('#mini').classList.remove('hide');
+            $('#mt').textContent=cur.title;$('#ms').textContent=cur.artist||'Hino';
+            $('#ft').textContent=cur.title;$('#fs').textContent=cur.artist||'Hino';
+            setArt($('#ma'),cur.title);setArt($('#fa'),cur.title);
+            const h=hue(cur.title);
+            $('#full').style.background='linear-gradient(180deg,hsl('+h+',55%,30%),#000 85%)';
+            $('#mnx').innerHTML=I.next;$('#pv').innerHTML=I.prev;$('#nx').innerHTML=I.next;
+            updPP();
+          }
+          function onEnded(){next()}
+          function onPlayError(){toast('Não foi possível tocar este hino');playing=false;updPP()}
+          const fill=v=>{$('#sk').style.background='linear-gradient(to right,#fff '+(v/10)+'%,rgba(255,255,255,.25) '+(v/10)+'%)'};
+          setInterval(()=>{
+            if(!cur)return;
+            try{
+              const a=Android.status().split(',').map(Number);
+              if(a[0]<0)return;
+              const np=a[0]===1;pos=a[1];dur=a[2];
+              if(np!==playing){playing=np;updPP()}
+              if(!seeking&&dur>0){const v=Math.round(pos/dur*1000);$('#sk').value=v;fill(v)}
+              $('#t1').textContent=fmt(pos);$('#t2').textContent='-'+fmt(dur-pos);
+            }catch(e){}
+          },500);
+          $('#sk').addEventListener('input',e=>{seeking=true;fill(+e.target.value)});
+          $('#sk').addEventListener('change',e=>{Android.seek(Math.floor(+e.target.value/1000*dur));seeking=false});
+          $('#mpp').onclick=toggle;$('#pp').onclick=toggle;
+          $('#mnx').onclick=next;$('#nx').onclick=next;$('#pv').onclick=prev;
+          $('#mopen').onclick=()=>$('#full').classList.add('open');
+          $('#ma').onclick=()=>$('#full').classList.add('open');
+          $('#fc').onclick=()=>$('#full').classList.remove('open');
+
+          /* ---------- Abas ---------- */
+          document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{
+            document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('on',x===b));
+            document.querySelectorAll('.screen').forEach(s=>s.classList.toggle('on',s.id==='s-'+b.dataset.t));
+          });
+
+          /* ---------- Buscar e baixar ---------- */
+          const msg=t=>{$('#nmsg').textContent=t;$('#nmsg').classList.toggle('hide',!t)};
+          function doSearch(){
+            const q=$('#nq').value.trim();if(!q)return;
+            if(!navigator.onLine){msg('Sem internet agora. Os hinos já baixados continuam tocando normalmente.');return}
+            msg('Buscando…');$('#net').innerHTML='';res=[];$('#nq').blur();Android.search(q);
+          }
+          function onSearch(s){res=JSON.parse(s);msg(res.length?'':'Nada encontrado. Tente outro nome.');renderNet()}
+          function onSearchErr(){msg('Não foi possível buscar. Verifique a internet.')}
+          function renderNet(){
+            $('#net').innerHTML=res.map((s,i)=>{
+              const p=dl[s.id];
+              const btn=done[s.id]?'<span class="ok">Baixado</span>':(p!=null?'<span class="pct">'+p+'%</span>':'<button class="get" data-i="'+i+'">Baixar</button>');
+              return '<div class="row">'+artHtml(s.title)+'<div class="info"><b>'+esc(s.title)+'</b><span>'+esc(s.artist||'Internet Archive')+'</span></div>'+btn+'</div>';
+            }).join('');
+          }
+          function onDl(id,p){
+            if(p<0){delete dl[id];toast('Falha ao baixar. Tente de novo.')}
+            else if(p>=100){delete dl[id];done[id]=true;toast('Hino baixado!');loadLib()}
+            else dl[id]=p;
+            renderNet();
+          }
+          $('#net').addEventListener('click',e=>{
+            const b=e.target.closest('.get');if(!b)return;
+            const s=res[+b.dataset.i];dl[s.id]=0;renderNet();Android.download(s.id,s.title,s.artist);
+          });
+          $('#go').onclick=doSearch;
+          $('#nq').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch()});
+
+          loadLib();
+          </script>
+          </body>
+          </html>
+          EOF
+
+      - name: Compilar o APK
+        working-directory: ZeteHino
+        run: |
+          gradle assembleDebug --no-daemon --stacktrace
+          cp app/build/outputs/apk/debug/app-debug.apk ZeteHino.apk
+
+      - name: Guardar o APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZeteHino-apk
+          path: ZeteHino/ZeteHino.apk
+
+      - name: Publicar release com o APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: ZeteHino v${{ github.run_number }}
+          files: ZeteHino/ZeteHino.apk
