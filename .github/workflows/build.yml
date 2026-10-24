@@ -84,6 +84,9 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
               <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
               <application
@@ -100,6 +103,10 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+                  <service
+                      android:name=".PlayerService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaPlayback" />
               </application>
           </manifest>
           EOF
@@ -147,8 +154,6 @@ jobs:
           class MainActivity : Activity() {
 
               private lateinit var web: WebView
-              private var mp: MediaPlayer? = null
-              @Volatile private var ready = false
 
               @SuppressLint("SetJavaScriptEnabled")
               override fun onCreate(savedInstanceState: Bundle?) {
@@ -163,7 +168,7 @@ jobs:
                   web.webViewClient = WebViewClient()
                   setContentView(web)
                   web.loadUrl("file:///android_asset/index.html")
-                  if (!hasPerm()) requestPermissions(arrayOf(permName()), 1)
+                  askAll()
               }
 
               override fun onResume() {
@@ -182,8 +187,6 @@ jobs:
               }
 
               override fun onDestroy() {
-                  mp?.release()
-                  mp = null
                   super.onDestroy()
               }
 
@@ -192,6 +195,16 @@ jobs:
                   else Manifest.permission.READ_EXTERNAL_STORAGE
 
               private fun hasPerm() = checkSelfPermission(permName()) == PackageManager.PERMISSION_GRANTED
+
+              private fun askAll() {
+                  val need = ArrayList<String>()
+                  if (!hasPerm()) need.add(permName())
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) need.add(Manifest.permission.POST_NOTIFICATIONS)
+                  if (need.isNotEmpty()) requestPermissions(need.toTypedArray(), 1)
+              }
+
 
               private fun js(code: String) {
                   runOnUiThread { web.evaluateJavascript(code, null) }
@@ -220,14 +233,14 @@ jobs:
               // ---------- Biblioteca ----------
               @JavascriptInterface
               fun askPerm() {
-                  runOnUiThread { requestPermissions(arrayOf(permName()), 1) }
+                  runOnUiThread { askAll() }
               }
 
               @JavascriptInterface
               fun library(): String {
                   val arr = JSONArray()
                   songsDir().listFiles()
-                      ?.filter { it.name.endsWith(".mp3") }
+                      ?.filter { it.extension.lowercase() in listOf("mp3", "m4a", "aac", "ogg", "opus", "wav", "flac") }
                       ?.sortedBy { it.name.lowercase() }
                       ?.forEach { f ->
                           val parts = f.nameWithoutExtension.split("__")
@@ -246,7 +259,7 @@ jobs:
                           MediaStore.Audio.Media.TITLE,
                           MediaStore.Audio.Media.ARTIST
                       )
-                      val sel = "${MediaStore.Audio.Media.IS_MUSIC}!=0 AND ${MediaStore.Audio.Media.DURATION}>=20000"
+                      val sel = "${MediaStore.Audio.Media.DURATION}>=20000 AND ${MediaStore.Audio.Media.IS_NOTIFICATION}=0 AND ${MediaStore.Audio.Media.IS_ALARM}=0 AND ${MediaStore.Audio.Media.IS_RINGTONE}=0 AND _data NOT LIKE '%Voice Notes%' AND _data NOT LIKE '%Recordings%'"
                       val order = "${MediaStore.Audio.Media.TITLE} COLLATE NOCASE ASC"
                       try {
                           contentResolver.query(base, cols, sel, null, order)?.use { c ->
@@ -266,30 +279,55 @@ jobs:
                   return arr.toString()
               }
 
-              // ---------- Player ----------
+              // ---------- Adicionar arquivo do celular ----------
               @JavascriptInterface
-              fun play(src: String) {
+              fun pick() {
                   runOnUiThread {
-                      try {
-                          ready = false
-                          mp?.release()
-                          val p = MediaPlayer()
-                          mp = p
-                          p.setAudioAttributes(
-                              AudioAttributes.Builder()
-                                  .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                                  .setUsage(AudioAttributes.USAGE_MEDIA)
-                                  .build()
-                          )
-                          p.setWakeMode(applicationContext, PowerManager.PARTIAL_WAKE_LOCK)
-                          if (src.startsWith("content://")) p.setDataSource(applicationContext, Uri.parse(src))
-                          else p.setDataSource(src)
-                          p.setOnPreparedListener { ready = true; it.start() }
-                          p.setOnCompletionListener { js("onEnded()") }
-                          p.setOnErrorListener { _, _, _ -> js("onPlayError()"); true }
-                          p.prepareAsync()
-                      } catch (e: Exception) {
-                          js("onPlayError()")
+                      val i = android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT)
+                      i.addCategory(android.content.Intent.CATEGORY_OPENABLE)
+                      i.type = "*/*"
+                      i.putExtra(android.content.Intent.EXTRA_MIME_TYPES, arrayOf("audio/*", "video/mp4"))
+                      i.putExtra(android.content.Intent.EXTRA_ALLOW_MULTIPLE, true)
+                      startActivityForResult(i, 2)
+                  }
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != 2 || resultCode != RESULT_OK || data == null) return
+                  val uris = mutableListOf<Uri>()
+                  data.data?.let { uris.add(it) }
+                  data.clipData?.let { cd -> for (k in 0 until cd.itemCount) uris.add(cd.getItemAt(k).uri) }
+                  thread {
+                      var n = 0
+                      for (u in uris) {
+                          try {
+                              var name = "hino"
+                              contentResolver.query(u, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                                  if (c.moveToFirst()) name = c.getString(0) ?: "hino"
+                              }
+                              val ext = name.substringAfterLast('.', "mp3").lowercase().let { if (it == "mp4") "m4a" else it }
+                              val title = name.substringBeforeLast('.').replace(Regex("[^\\p{L}\\p{N} .()-]"), "").trim().take(80).ifEmpty { "hino" }
+                              val out = File(songsDir(), "$title.$ext")
+                              contentResolver.openInputStream(u)?.use { inp -> out.outputStream().use { o -> inp.copyTo(o) } }
+                              n++
+                          } catch (e: Exception) { }
+                      }
+                      js("toast('" + n + " hino(s) adicionado(s)');loadLib()")
+                  }
+              }
+
+              // ---------- Player (o som toca no PlayerService) ----------
+              @JavascriptInterface
+              fun playQueue(json: String, i: Int) {
+                  val list = PlayerService.parse(json)
+                  runOnUiThread {
+                      val s = PlayerService.inst
+                      if (s != null) {
+                          s.playQueue(list, i)
+                      } else {
+                          PlayerService.pending = list
+                          PlayerService.send(this, PlayerService.A_PLAY, i)
                       }
                   }
               }
@@ -297,31 +335,49 @@ jobs:
               @JavascriptInterface
               fun toggle() {
                   runOnUiThread {
-                      val p = mp
-                      if (p != null && ready) {
-                          if (p.isPlaying) p.pause() else p.start()
-                      }
+                      val s = PlayerService.inst
+                      if (s != null) s.toggle() else PlayerService.send(this, PlayerService.A_RESUME, 0)
                   }
+              }
+
+              @JavascriptInterface
+              fun next() {
+                  runOnUiThread { PlayerService.inst?.next() }
+              }
+
+              @JavascriptInterface
+              fun prev() {
+                  runOnUiThread { PlayerService.inst?.prev() }
               }
 
               @JavascriptInterface
               fun seek(ms: Int) {
                   runOnUiThread {
-                      val p = mp
-                      if (p != null && ready) p.seekTo(ms)
+                      val s = PlayerService.inst
+                      if (s != null) s.seek(ms)
+                      else getSharedPreferences("zh", MODE_PRIVATE).edit().putInt("pos", ms).apply()
                   }
               }
 
               @JavascriptInterface
               fun status(): String {
-                  return try {
-                      val p = mp
-                      if (p != null && ready) "${if (p.isPlaying) 1 else 0},${p.currentPosition},${p.duration}"
-                      else "-1,0,0"
-                  } catch (e: Exception) {
-                      "-1,0,0"
+                  val s = PlayerService.inst
+                  return if (s != null) s.snapshot() else PlayerService.savedSnapshot(this)
+              }
+
+              // ---------- YouTube ----------
+              @JavascriptInterface
+              fun openYoutube(q: String) {
+                  runOnUiThread {
+                      try {
+                          val u = "https://www.youtube.com/results?search_query=" + URLEncoder.encode(q, "UTF-8")
+                          startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, Uri.parse(u)))
+                      } catch (e: Exception) {
+                          js("toast('Não foi possível abrir o YouTube')")
+                      }
                   }
               }
+
 
               // ---------- Buscar e baixar (Internet Archive) ----------
               @JavascriptInterface
@@ -399,6 +455,402 @@ jobs:
                       } catch (e: Exception) {
                           js("onDl($qid,-1)")
                       }
+                  }
+              }
+          }
+          EOF
+
+          cat > $P/java/org/zetehino/app/PlayerService.kt <<'EOF'
+          package org.zetehino.app
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.ServiceInfo
+          import android.graphics.drawable.Icon
+          import android.media.AudioAttributes
+          import android.media.AudioManager
+          import android.media.MediaPlayer
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.PowerManager
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          data class Song(val title: String, val artist: String, val src: String)
+
+          class PlayerService : Service() {
+
+              companion object {
+                  @Volatile var inst: PlayerService? = null
+                  @Volatile var pending: List<Song> = emptyList()
+                  const val CH = "zetehino_player"
+                  const val NID = 7
+                  const val A_PLAY = "zh.play"
+                  const val A_RESUME = "zh.resume"
+                  const val A_TOGGLE = "zh.toggle"
+                  const val A_NEXT = "zh.next"
+                  const val A_PREV = "zh.prev"
+                  const val A_STOP = "zh.stop"
+
+                  fun send(ctx: Context, action: String, i: Int) {
+                      val intent = Intent(ctx, PlayerService::class.java).setAction(action).putExtra("i", i)
+                      if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(intent) else ctx.startService(intent)
+                  }
+
+                  fun parse(json: String): List<Song> {
+                      val out = ArrayList<Song>()
+                      try {
+                          val a = JSONArray(json)
+                          for (k in 0 until a.length()) {
+                              val o = a.getJSONObject(k)
+                              out.add(Song(o.optString("t"), o.optString("a"), o.optString("s")))
+                          }
+                      } catch (e: Exception) { }
+                      return out
+                  }
+
+                  fun toJson(l: List<Song>): String {
+                      val a = JSONArray()
+                      for (s in l) a.put(JSONObject().put("t", s.title).put("a", s.artist).put("s", s.src))
+                      return a.toString()
+                  }
+
+                  // Estado salvo (usado quando o serviço ainda não está rodando): mostra o último hino parado onde parou
+                  fun savedSnapshot(ctx: Context): String {
+                      val sp = ctx.getSharedPreferences("zh", Context.MODE_PRIVATE)
+                      val src = sp.getString("cs", "") ?: ""
+                      if (src.isEmpty()) return JSONObject().put("has", 0).toString()
+                      return JSONObject()
+                          .put("has", 1).put("r", 0).put("p", 0)
+                          .put("pos", sp.getInt("pos", 0)).put("dur", sp.getInt("d", 0))
+                          .put("t", sp.getString("ct", "")).put("a", sp.getString("ca", "")).put("s", src)
+                          .put("e", 0).toString()
+                  }
+              }
+
+              private var mp: MediaPlayer? = null
+              @Volatile private var ready = false
+              @Volatile private var want = false
+              @Volatile private var failed = false
+              @Volatile private var err = false
+              private var queue: List<Song> = emptyList()
+              private var idx = -1
+              private var startAt = 0
+              private var savedDur = 0
+              private var wasPlaying = false
+              private val h = Handler(Looper.getMainLooper())
+              private lateinit var am: AudioManager
+
+              private val saver = object : Runnable {
+                  override fun run() {
+                      save()
+                      h.postDelayed(this, 5000)
+                  }
+              }
+
+              private val noisy = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context?, i: Intent?) {
+                      wasPlaying = false
+                      pauseP()
+                  }
+              }
+
+              private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
+                  when (change) {
+                      AudioManager.AUDIOFOCUS_LOSS -> { wasPlaying = false; pauseP() }
+                      AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> { wasPlaying = want; pauseP() }
+                      AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> { try { mp?.setVolume(0.25f, 0.25f) } catch (e: Exception) { } }
+                      AudioManager.AUDIOFOCUS_GAIN -> {
+                          try { mp?.setVolume(1f, 1f) } catch (e: Exception) { }
+                          if (wasPlaying) { wasPlaying = false; resumeP() }
+                      }
+                      else -> { }
+                  }
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  inst = this
+                  am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      val ch = NotificationChannel(CH, "Player", NotificationManager.IMPORTANCE_LOW)
+                      (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
+                  }
+                  registerReceiver(noisy, IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY))
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      A_PLAY -> {
+                          want = true
+                          refresh()
+                          if (pending.isNotEmpty()) { queue = pending; saveQueue() }
+                          playIdx(intent?.getIntExtra("i", 0) ?: 0, 0)
+                      }
+                      A_RESUME -> {
+                          if (queue.isEmpty()) loadSaved()
+                          want = true
+                          refresh()
+                          if (queue.isEmpty()) stopAll() else playIdx(idx, startAt)
+                      }
+                      A_TOGGLE -> toggle()
+                      A_NEXT -> next()
+                      A_PREV -> prev()
+                      A_STOP -> stopAll()
+                      else -> { }
+                  }
+                  return START_NOT_STICKY
+              }
+
+              override fun onDestroy() {
+                  save()
+                  h.removeCallbacks(saver)
+                  try { unregisterReceiver(noisy) } catch (e: Exception) { }
+                  try { mp?.release() } catch (e: Exception) { }
+                  mp = null
+                  @Suppress("DEPRECATION")
+                  am.abandonAudioFocus(focusListener)
+                  inst = null
+                  super.onDestroy()
+              }
+
+              // ---------- Controles (sempre chamados na thread principal) ----------
+              fun playQueue(l: List<Song>, i: Int) {
+                  queue = l
+                  saveQueue()
+                  playIdx(i, 0)
+              }
+
+              fun toggle() {
+                  wasPlaying = false
+                  if (ready) {
+                      if (want) pauseP() else resumeP()
+                  } else if (mp == null || failed) {
+                      if (queue.isEmpty()) loadSaved()
+                      if (queue.isNotEmpty()) playIdx(if (idx < 0) 0 else idx, startAt)
+                  }
+              }
+
+              fun next() {
+                  if (queue.isNotEmpty()) playIdx(idx + 1, 0)
+              }
+
+              fun prev() {
+                  if (queue.isEmpty()) return
+                  var pos = 0
+                  try { if (ready) pos = mp?.currentPosition ?: 0 } catch (e: Exception) { }
+                  if (pos > 3000) seek(0) else playIdx(idx - 1, 0)
+              }
+
+              fun seek(ms: Int) {
+                  if (ready) {
+                      try { mp?.seekTo(ms) } catch (e: Exception) { }
+                  } else {
+                      startAt = ms
+                  }
+              }
+
+              fun snapshot(): String {
+                  val s = queue.getOrNull(idx) ?: return savedSnapshot(this)
+                  var pos = startAt
+                  var dur = savedDur
+                  var pl = false
+                  try {
+                      val p = mp
+                      if (p != null && ready) {
+                          pos = p.currentPosition
+                          dur = p.duration
+                          pl = p.isPlaying
+                      }
+                  } catch (e: Exception) { }
+                  val e = if (err) 1 else 0
+                  err = false
+                  return JSONObject()
+                      .put("has", 1).put("r", if (ready) 1 else 0).put("p", if (pl) 1 else 0)
+                      .put("pos", pos).put("dur", dur)
+                      .put("t", s.title).put("a", s.artist).put("s", s.src)
+                      .put("e", e).toString()
+              }
+
+              // ---------- Interno ----------
+              private fun focus() {
+                  @Suppress("DEPRECATION")
+                  am.requestAudioFocus(focusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
+              }
+
+              private fun playIdx(i: Int, at: Int) {
+                  if (queue.isEmpty()) {
+                      want = false
+                      refresh()
+                      return
+                  }
+                  idx = ((i % queue.size) + queue.size) % queue.size
+                  startAt = at
+                  failed = false
+                  want = true
+                  refresh()
+                  val s = queue[idx]
+                  ready = false
+                  try { mp?.release() } catch (e: Exception) { }
+                  val p = MediaPlayer()
+                  mp = p
+                  try {
+                      p.setAudioAttributes(
+                          AudioAttributes.Builder()
+                              .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                              .setUsage(AudioAttributes.USAGE_MEDIA)
+                              .build()
+                      )
+                      p.setWakeMode(applicationContext, PowerManager.PARTIAL_WAKE_LOCK)
+                      if (s.src.startsWith("content://")) p.setDataSource(applicationContext, Uri.parse(s.src))
+                      else p.setDataSource(s.src)
+                      p.setOnPreparedListener { player ->
+                          if (mp === player) {
+                              ready = true
+                              val a = startAt
+                              startAt = 0
+                              if (a > 0) player.seekTo(a)
+                              if (want) { focus(); player.start() }
+                              refresh()
+                          }
+                      }
+                      p.setOnCompletionListener { player ->
+                          if (mp === player) h.post { playIdx(idx + 1, 0) }
+                      }
+                      p.setOnErrorListener { _, _, _ ->
+                          err = true
+                          failed = true
+                          ready = false
+                          want = false
+                          refresh()
+                          true
+                      }
+                      p.prepareAsync()
+                  } catch (e: Exception) {
+                      err = true
+                      failed = true
+                      want = false
+                      refresh()
+                  }
+                  save()
+                  h.removeCallbacks(saver)
+                  h.postDelayed(saver, 5000)
+              }
+
+              private fun pauseP() {
+                  want = false
+                  try { if (ready && mp?.isPlaying == true) mp?.pause() } catch (e: Exception) { }
+                  save()
+                  refresh()
+              }
+
+              private fun resumeP() {
+                  if (!ready) return
+                  want = true
+                  focus()
+                  try { mp?.start() } catch (e: Exception) { }
+                  refresh()
+              }
+
+              private fun stopAll() {
+                  want = false
+                  save()
+                  h.removeCallbacks(saver)
+                  try { mp?.release() } catch (e: Exception) { }
+                  mp = null
+                  ready = false
+                  @Suppress("DEPRECATION")
+                  stopForeground(true)
+                  stopSelf()
+              }
+
+              private fun saveQueue() {
+                  getSharedPreferences("zh", MODE_PRIVATE).edit().putString("q", toJson(queue)).apply()
+              }
+
+              private fun loadSaved() {
+                  val sp = getSharedPreferences("zh", MODE_PRIVATE)
+                  val q = parse(sp.getString("q", "") ?: "")
+                  if (q.isEmpty()) return
+                  queue = q
+                  idx = sp.getInt("i", 0).coerceIn(0, q.size - 1)
+                  startAt = sp.getInt("pos", 0)
+                  savedDur = sp.getInt("d", 0)
+              }
+
+              private fun save() {
+                  val s = queue.getOrNull(idx) ?: return
+                  var pos = startAt
+                  var d = savedDur
+                  try {
+                      val p = mp
+                      if (p != null && ready) {
+                          pos = p.currentPosition
+                          d = p.duration
+                      }
+                  } catch (e: Exception) { }
+                  savedDur = d
+                  getSharedPreferences("zh", MODE_PRIVATE).edit()
+                      .putInt("i", idx).putInt("pos", pos).putInt("d", d)
+                      .putString("ct", s.title).putString("ca", s.artist).putString("cs", s.src)
+                      .apply()
+              }
+
+              private fun pi(action: String): PendingIntent =
+                  PendingIntent.getService(
+                      this, action.hashCode(),
+                      Intent(this, PlayerService::class.java).setAction(action),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+
+              private fun act(icon: Int, label: String, action: String): Notification.Action =
+                  Notification.Action.Builder(Icon.createWithResource(this, icon), label, pi(action)).build()
+
+              private fun buildNotif(): Notification {
+                  val s = queue.getOrNull(idx)
+                  val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CH) else Notification.Builder(this)
+                  b.setSmallIcon(android.R.drawable.ic_media_play)
+                  b.setContentTitle(s?.title ?: "ZeteHino")
+                  b.setContentText(if (s != null && s.artist.isNotEmpty()) s.artist else "Hinos")
+                  val open = packageManager.getLaunchIntentForPackage(packageName)
+                  if (open != null) {
+                      b.setContentIntent(
+                          PendingIntent.getActivity(this, 0, open, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+                      )
+                  }
+                  b.setOngoing(true)
+                  b.setOnlyAlertOnce(true)
+                  b.setVisibility(Notification.VISIBILITY_PUBLIC)
+                  b.addAction(act(android.R.drawable.ic_media_previous, "Anterior", A_PREV))
+                  if (want) b.addAction(act(android.R.drawable.ic_media_pause, "Pausar", A_TOGGLE))
+                  else b.addAction(act(android.R.drawable.ic_media_play, "Tocar", A_TOGGLE))
+                  b.addAction(act(android.R.drawable.ic_media_next, "Próximo", A_NEXT))
+                  b.addAction(act(android.R.drawable.ic_menu_close_clear_cancel, "Fechar", A_STOP))
+                  b.setStyle(Notification.MediaStyle().setShowActionsInCompactView(0, 1, 2))
+                  return b.build()
+              }
+
+              private fun refresh() {
+                  val n = buildNotif()
+                  try {
+                      if (Build.VERSION.SDK_INT >= 29)
+                          startForeground(NID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+                      else
+                          startForeground(NID, n)
+                  } catch (e: Exception) {
+                      (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(NID, n)
                   }
               }
           }
@@ -490,6 +942,7 @@ jobs:
             <section id="s-lib" class="screen on">
               <h1>Hinos</h1>
               <input id="fl" class="field" type="search" placeholder="Procurar nos meus hinos" autocomplete="off">
+              <button id="add" class="btn" style="width:100%;margin-bottom:12px;background:var(--card2);color:var(--acc)">+ Adicionar música do celular</button>
               <div id="lib"></div>
             </section>
             <section id="s-net" class="screen">
@@ -498,6 +951,7 @@ jobs:
                 <input id="nq" class="field" type="search" placeholder="Nome do hino ou artista" autocomplete="off">
                 <button id="go" class="btn">Buscar</button>
               </div>
+              <button id="yt" class="btn" style="width:100%;margin-bottom:6px;background:var(--card2);color:#ff453a">▶ Procurar no YouTube</button>
               <p id="nmsg" class="hint">Digite o nome e toque em Buscar. Os hinos baixados ficam salvos no celular e tocam sem internet.</p>
               <div id="net"></div>
             </section>
@@ -576,10 +1030,12 @@ jobs:
           $('#lib').addEventListener('click',e=>{const r=e.target.closest('.row');if(r)start(view,+r.dataset.i)});
 
           /* ---------- Player ---------- */
-          function start(list,i){queue=list.slice();qi=i;playCur()}
-          function playCur(){cur=queue[qi];playing=true;pos=0;dur=0;Android.play(cur.src);updUI();hl()}
-          function next(){if(!queue.length)return;qi=(qi+1)%queue.length;playCur()}
-          function prev(){if(!queue.length)return;if(pos>3000){Android.seek(0);return}qi=(qi-1+queue.length)%queue.length;playCur()}
+          function start(list,i){
+            Android.playQueue(JSON.stringify(list.map(s=>({t:s.title,a:s.artist,s:s.src}))),i);
+            cur=list[i];playing=true;pos=0;dur=0;updUI();hl();
+          }
+          function next(){Android.next()}
+          function prev(){Android.prev()}
           function toggle(){Android.toggle();playing=!playing;updPP()}
           function updPP(){const h=playing?I.pause:I.play;$('#mpp').innerHTML=h;$('#pp').innerHTML=h}
           function updUI(){
@@ -593,20 +1049,22 @@ jobs:
             $('#mnx').innerHTML=I.next;$('#pv').innerHTML=I.prev;$('#nx').innerHTML=I.next;
             updPP();
           }
-          function onEnded(){next()}
-          function onPlayError(){toast('Não foi possível tocar este hino');playing=false;updPP()}
           const fill=v=>{$('#sk').style.background='linear-gradient(to right,#fff '+(v/10)+'%,rgba(255,255,255,.25) '+(v/10)+'%)'};
-          setInterval(()=>{
-            if(!cur)return;
+          /* O serviço (nativo) é quem manda: aqui só mostramos o estado dele.
+             Se o app foi fechado, o último hino aparece parado no ponto onde parou. */
+          function poll(){
             try{
-              const a=Android.status().split(',').map(Number);
-              if(a[0]<0)return;
-              const np=a[0]===1;pos=a[1];dur=a[2];
-              if(np!==playing){playing=np;updPP()}
+              const a=JSON.parse(Android.status());
+              if(!a.has)return;
+              if(!cur||cur.src!==a.s){cur={title:a.t,artist:a.a,src:a.s};updUI();hl()}
+              if(a.r===1&&(a.p===1)!==playing){playing=a.p===1;updPP()}
+              if(a.e){toast('Não foi possível tocar este hino');playing=false;updPP()}
+              pos=a.pos;dur=a.dur;
               if(!seeking&&dur>0){const v=Math.round(pos/dur*1000);$('#sk').value=v;fill(v)}
               $('#t1').textContent=fmt(pos);$('#t2').textContent='-'+fmt(dur-pos);
             }catch(e){}
-          },500);
+          }
+          setInterval(poll,500);
           $('#sk').addEventListener('input',e=>{seeking=true;fill(+e.target.value)});
           $('#sk').addEventListener('change',e=>{Android.seek(Math.floor(+e.target.value/1000*dur));seeking=false});
           $('#mpp').onclick=toggle;$('#pp').onclick=toggle;
@@ -614,6 +1072,7 @@ jobs:
           $('#mopen').onclick=()=>$('#full').classList.add('open');
           $('#ma').onclick=()=>$('#full').classList.add('open');
           $('#fc').onclick=()=>$('#full').classList.remove('open');
+          poll();
 
           /* ---------- Abas ---------- */
           document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{
@@ -648,6 +1107,8 @@ jobs:
             const s=res[+b.dataset.i];dl[s.id]=0;renderNet();Android.download(s.id,s.title,s.artist);
           });
           $('#go').onclick=doSearch;
+          $('#yt').onclick=()=>{const q=$('#nq').value.trim();if(!q){toast('Digite o nome do hino primeiro');return}Android.openYoutube(q)};
+          $('#add').onclick=()=>Android.pick();
           $('#nq').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch()});
 
           loadLib();
